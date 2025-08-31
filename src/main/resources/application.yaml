@@ -1,0 +1,21 @@
+relay:
+  apis:
+    - name: abc
+      group: external-A
+      base-url: "http://localhost:8000"
+      spec-url: "http://localhost:8000/schema/openapi.json"
+    - name: xyz
+      group: external-A
+      base-url: "http://localhost:8000"
+      spec-url: "http://localhost:8000/schema/openapi.json"
+    - name: legacy
+      group: external-B
+      base-url: "http://localhost:8000"
+      spec-url: "http://localhost:8000/schema/openapi.json"
+
+
+springdoc:
+  swagger-ui:
+    enabled: true
+    disable-swagger-default-url: true
+    # config-url: /swagger-config/single/abc
