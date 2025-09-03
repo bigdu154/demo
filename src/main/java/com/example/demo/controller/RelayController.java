@@ -1,168 +1,162 @@
 package com.example.demo.controller;
 
+import org.apache.http.Header;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.*;
+import org.apache.http.entity.ByteArrayEntity;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
+import javax.annotation.PreDestroy;
 import javax.servlet.http.HttpServletRequest;
-import java.net.URI;
-import java.util.Optional;
+import java.io.InputStream;
+import java.util.*;
 
-import com.example.demo.config.ApiSpecProperties;
-
+/**
+ * A 서버가 인증을 끝낸 뒤 B 서버로 요청을 릴레이하고,
+ * B의 응답을 그대로 클라이언트에 흘려보내는 컨트롤러.
+ *
+ * - URL: aHost/api/v1/**  →  bHost/api/v1/**
+ * - 상태코드/헤더/바디 유지
+ * - 스트리밍 전송 (대용량/Chunked 응답 적합)
+ * - Swagger 문서/정적 오픈API/커스텀 프리픽스는 예외
+ */
 @RestController
+@RequestMapping("${app.passthrough-prefix:/api}")
 public class RelayController {
 
-        private final RestTemplate rt = new RestTemplate();
-        private final ApiSpecProperties props;
+    @Value("${app.target-base-url}")
+    private String targetBase; // e.g. https://bHost  (마지막 슬래시 X)
 
-        public RelayController(ApiSpecProperties props) {
-                this.props = props;
+    // 릴레이에서 제거해야 할 hop-by-hop 헤더들 (RFC 7230)
+    private static final Set<String> HOP_BY_HOP = new HashSet<>(Arrays.asList(
+            "connection","keep-alive","proxy-authenticate","proxy-authorization",
+            "te","trailer","transfer-encoding","upgrade"
+    ));
+
+    // 릴레이를 타면 안 되는 경로(prefix 기준) — 필요에 맞게 수정
+    private static final List<String> EXCLUDED_PREFIXES = Arrays.asList(
+        "/v3/api-docs",           // springdoc api docs
+        "/swagger-ui",            // swagger ui
+            "/ext/openapi-b.json",    // 외부 스펙 프록시/정적 경로
+            "/api/v1/custom"          // 예: 네가 직접 만든 커스텀 API 프리픽스
+    );
+
+    private final CloseableHttpClient http;
+
+    public RelayController() {
+        RequestConfig cfg = RequestConfig.custom()
+                .setConnectTimeout(10_000)
+                .setSocketTimeout(60_000)
+                .build();
+
+        this.http = HttpClients.custom()
+                .setDefaultRequestConfig(cfg)
+                .setMaxConnTotal(200)
+                .setMaxConnPerRoute(50)
+                .build();
+    }
+
+    @PreDestroy
+    public void close() throws Exception {
+        http.close();
+    }
+
+    @RequestMapping(
+            value = "/**",
+            method = {RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT,
+                      RequestMethod.DELETE, RequestMethod.PATCH, RequestMethod.HEAD,
+                      RequestMethod.OPTIONS})
+    public ResponseEntity<StreamingResponseBody> relay(HttpServletRequest req) throws Exception {
+        final String path = req.getRequestURI();      // ex) /api/v1/abc
+        final String query = req.getQueryString();    // ex) x=1&y=2
+
+        // 1) 예외 경로는 릴레이하지 않음 (스프링의 정확 매핑 우선 규칙 + 방어적 제외)
+        for (String prefix : EXCLUDED_PREFIXES) {
+            if (path.startsWith(prefix)) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            }
         }
 
-        /**
-         * relay 없이: "/{name}/**" 로 바로 프록시
-         * 예) /abc/posts → baseUrl/posts
-         */
-        @RequestMapping(value = "/{name:^(?!swagger-ui$|swagger-ui\\.html$|v3$|external-specs$|swagger-config$|docs$|actuator$|error$|favicon\\.ico$).+}/**", method = {
-                        RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT,
-                        RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.OPTIONS, RequestMethod.HEAD
-        })
-        public ResponseEntity<byte[]> proxy(@PathVariable String name,
-                        HttpMethod method,
-                        @RequestBody(required = false) byte[] body,
-                        HttpServletRequest req,
-                        @RequestHeader HttpHeaders inHeaders) {
+        // 2) B 서버로 보낼 최종 URL (경로/쿼리 그대로 유지)
+        final String targetUrl = targetBase + path + (query != null ? "?" + query : "");
 
-                var api = props.getApis().stream()
-                                .filter(a -> a.getName().equalsIgnoreCase(name))
-                                .findFirst()
-                                .orElse(null);
-                if (api == null) {
-                        return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                                        .contentType(MediaType.TEXT_PLAIN)
-                                        .body(("Unknown API name: " + name).getBytes());
-                }
+        // 3) B로 나가는 요청 구성
+        HttpRequestBase outbound = buildOutboundWithBodyIfNeeded(req, targetUrl);
+        copyRequestHeaders(req, outbound);
 
-                String requestUri = req.getRequestURI(); // e.g. "" or "/abc/api/posts/posts"
-                String contextPath = Optional.ofNullable(req.getContextPath()).orElse(""); // e.g. "" or "/app"
+        // 3-1) (선택) A→B 서비스 인증 토큰 주입 위치
+        // outbound.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + issueServiceTokenForB());
 
-                String mount = contextPath + "/" + name; // e.g. "/abc" (contextPath가 있으면 "/app/abc")
-                String remainder;
-                if (requestUri.equals(mount)) {
-                        remainder = ""; // 정확히 "/{name}" 로 끝나는 경우
-                } else if (requestUri.startsWith(mount + "/")) {
-                        remainder = requestUri.substring((mount + "/").length()); // "api/posts/posts"
-                } else {
-                        // 예외 상황: 패턴이 예상과 다를 때 최후의 방어
-                        remainder = requestUri;
-                        if (remainder.startsWith("/"))
-                                remainder = remainder.substring(1);
-                }
+        // 4) 실행 & 응답 스트리밍
+        CloseableHttpResponse bRes = http.execute(outbound);
 
-                // 업스트림 URL 안전하게 조립
-                String targetBase = trimTrailingSlash(api.getBaseUrl()); // e.g. https://api.example.com
-                String targetUrl = remainder.isEmpty() ? targetBase : targetBase + "/" + remainder;
-                // 쿼리 보존
-                if (req.getQueryString() != null && !req.getQueryString().isBlank()) {
-                        targetUrl = targetUrl + "?" + req.getQueryString();
-                }
-
-                // 요청 헤더: Hop-by-Hop 제거 + Host 제거 (RestTemplate가 채움)
-                HttpHeaders outHeaders = new HttpHeaders();
-                inHeaders.forEach((k, v) -> {
-                        if (!isHopByHop(k) && !HttpHeaders.HOST.equalsIgnoreCase(k)) {
-                                outHeaders.put(k, v);
-                        }
-                });
-
-                // X-Forwarded-* 추가 (업스트림에서 원 요청 맥락 파악 가능)
-                outHeaders.set("X-Forwarded-Host", req.getServerName()
-                                + ((req.getServerPort() == 80 || req.getServerPort() == 443) ? ""
-                                                : ":" + req.getServerPort()));
-                outHeaders.set("X-Forwarded-Proto", req.getScheme());
-                outHeaders.set("X-Forwarded-For", Optional.ofNullable(req.getHeader("X-Forwarded-For"))
-                                .map(x -> x + ", " + req.getRemoteAddr()).orElse(req.getRemoteAddr()));
-
-                // RestTemplate 타임아웃(선택): 생성자에서 세팅했다면 생략 가능
-                // (필요 시 Bean으로 HttpComponentsClientHttpRequestFactory 설정 권장)
-
-                ResponseEntity<byte[]> upstreamResp;
-                try {
-                        upstreamResp = rt.exchange(URI.create(targetUrl), method,
-                                        new HttpEntity<>(body, outHeaders), byte[].class);
-                } catch (Exception ex) {
-                        // 업스트림 연결 실패 등
-                        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                                        .contentType(MediaType.TEXT_PLAIN)
-                                        .body(("Upstream request failed: " + ex.getClass().getSimpleName() + " - "
-                                                        + ex.getMessage()).getBytes());
-                }
-
-                // 응답 헤더: Hop-by-Hop 제거 + Location 리라이트(리다이렉트 등)
-                HttpHeaders respHeaders = new HttpHeaders();
-                upstreamResp.getHeaders().forEach((k, v) -> {
-                        if (!isHopByHop(k)) {
-                                respHeaders.put(k, v);
-                        }
-                });
-
-                // Location 헤더가 업스트림 절대경로면 → 프록시 경유 경로로 바꿔주기 (/ {name} / …)
-                rewriteLocationHeader(respHeaders, api.getBaseUrl(), name);
-
-                return new ResponseEntity<>(upstreamResp.getBody(), respHeaders, upstreamResp.getStatusCode());
+        HttpHeaders headers = new HttpHeaders();
+        for (Header h : bRes.getAllHeaders()) {
+            String lower = h.getName().toLowerCase(Locale.ROOT);
+            if (!HOP_BY_HOP.contains(lower)) {
+                headers.add(h.getName(), h.getValue());
+            }
         }
 
-        /* === helpers === */
-
-        private static boolean isHopByHop(String headerName) {
-                String h = headerName.toLowerCase();
-                return h.equals("connection")
-                                || h.equals("keep-alive")
-                                || h.equals("proxy-authenticate")
-                                || h.equals("proxy-authorization")
-                                || h.equals("te")
-                                || h.equals("trailer")
-                                || h.equals("transfer-encoding")
-                                || h.equals("upgrade");
-        }
-
-        private static String trimTrailingSlash(String s) {
-                if (s == null || s.isEmpty())
-                        return s;
-                int i = s.length();
-                while (i > 0 && s.charAt(i - 1) == '/')
-                        i--;
-                return (i == s.length()) ? s : s.substring(0, i);
-        }
-
-        private static void rewriteLocationHeader(HttpHeaders headers, String upstreamBase, String name) {
-                if (!headers.containsKey(HttpHeaders.LOCATION))
-                        return;
-                String loc = headers.getFirst(HttpHeaders.LOCATION);
-                if (loc == null || loc.isBlank())
-                        return;
-
-                String base = trimTrailingSlash(upstreamBase); // e.g. https://api.example.com
-                try {
-                        URI locUri = URI.create(loc);
-                        // 업스트림 절대 URL인지 판단
-                        if (locUri.isAbsolute()) {
-                                // 업스트림 base로 시작하면 → 프록시 경로로 치환
-                                // ex) https://api.example.com/foo -> /{name}/foo
-                                String locStr = locUri.toString();
-                                if (locStr.startsWith(base + "/") || locStr.equals(base)) {
-                                        String remainder = locStr.substring(base.length()); // leading "/" 포함 가능
-                                        if (remainder.isEmpty())
-                                                remainder = "/";
-                                        String proxyPath = "/" + name
-                                                        + (remainder.startsWith("/") ? remainder : "/" + remainder);
-                                        headers.set(HttpHeaders.LOCATION, proxyPath);
-                                }
-                        }
-                } catch (IllegalArgumentException ignore) {
-                        // 잘못된 Location이면 패스
+        StreamingResponseBody body = os -> {
+            try (InputStream is = (bRes.getEntity() != null) ? bRes.getEntity().getContent() : InputStream.nullInputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) != -1) {
+                    os.write(buf, 0, n);
                 }
-        }
+            } finally {
+                bRes.close();
+            }
+        };
 
+        int status = bRes.getStatusLine().getStatusCode();
+        return new ResponseEntity<>(body, headers, HttpStatus.valueOf(status));
+    }
+
+    private HttpRequestBase buildOutboundWithBodyIfNeeded(HttpServletRequest req, String url) throws Exception {
+        String method = req.getMethod();
+        switch (method) {
+            case "GET":     return new HttpGet(url);
+            case "DELETE":  return new HttpDelete(url);
+            case "HEAD":    return new HttpHead(url);
+            case "OPTIONS": return new HttpOptions(url);
+            case "POST":
+            case "PUT":
+            case "PATCH": {
+                HttpEntityEnclosingRequestBase r =
+                        method.equals("POST") ? new HttpPost(url) :
+                        method.equals("PUT")  ? new HttpPut(url)  : new HttpPatch(url);
+                byte[] body = req.getInputStream().readAllBytes();
+                if (body.length > 0) {
+                    r.setEntity(new ByteArrayEntity(body));
+                }
+                return r;
+            }
+            default:
+                throw new IllegalArgumentException("Unsupported method: " + method);
+        }
+    }
+
+    private void copyRequestHeaders(HttpServletRequest req, HttpRequestBase out) {
+        Enumeration<String> names = req.getHeaderNames();
+        while (names.hasMoreElements()) {
+            String name = names.nextElement();
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (HOP_BY_HOP.contains(lower) || "host".equals(lower)) continue;
+
+            Enumeration<String> values = req.getHeaders(name);
+            while (values.hasMoreElements()) {
+                out.addHeader(name, values.nextElement());
+            }
+        }
+    }
+
+    // (예시) B용 서비스 토큰 발급/캐시 로직을 여기에 구현
+    // private String issueServiceTokenForB() { ... }
 }

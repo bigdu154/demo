@@ -1,21 +1,22 @@
-relay:
-  apis:
-    - name: abc
-      group: external-A
-      base-url: "http://localhost:8000"
-      spec-url: "http://localhost:8000/schema/openapi.json"
-    - name: xyz
-      group: external-A
-      base-url: "http://localhost:8000"
-      spec-url: "http://localhost:8000/schema/openapi.json"
-    - name: legacy
-      group: external-B
-      base-url: "http://localhost:8000"
-      spec-url: "http://localhost:8000/schema/openapi.json"
-
+  # @Value("${app.openapi.external-spec-url}") private String externalSpecUrl;
+  # @Value("${app.openapi.tag-prefix:[B] }")   private String tagPrefix;
+  # @Value("${app.openapi.path-prefix:}")     private String pathPrefix;
+  # @Value("${app.openapi.prefer-local:true}") private boolean preferLocal;
+app:
+  openapi-url: "http://localhost:8000/schema/openapi.json"   # B의 스펙 URL
+  # 병합 정책
+  tag-prefix: "[B] "          # B에서 온 API에 태그 접두어(선택)
+  path-prefix: ""             # B 경로 앞에 붙일 프리픽스(충돌 회피용, 필요 시 '/b' 등)
+  prefer-local: true          # 경로 충돌 시 A(내 API) 우선
+  target-base-url: "http://localhost:8000"
 
 springdoc:
+  api-docs:
+    path: /v3/api-docs          # 한 문서만 노출
   swagger-ui:
-    enabled: true
-    disable-swagger-default-url: true
-    # config-url: /swagger-config/single/abc
+    path: /swagger-ui.html
+    # urls 설정 안 함(= 단일 문서)
+
+relay:
+  base-url: "http://localhost:8000"
+  spec-url: "http://localhost:8000/schema/openapi.json"
